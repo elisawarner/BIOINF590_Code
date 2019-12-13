@@ -1,0 +1,232 @@
+---
+title: "scRNA Covariance Patient Classification - Gene Filtering"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+library(dplyr)
+library(tibble)
+library(Seurat)
+library(corrplot)
+library(caret)
+library(future)
+library(ppcor)
+```
+
+```{r}
+# set up paralellization
+plan("multiprocess", workers = 3)
+plan()
+options(future.globals.maxSize = 1000 * 1024^2)
+
+# set up directory
+setwd("~/rao_lab/Single Cell/single_cell/pasca_paper_2/classification_dataset")
+
+# Load in data
+file_names <- c('PCATissueSubset1196.RData', 'PCATissueSubset1258.RData', 'PCATissueSubset1294.RData',
+                'PCATissueSubset1296.RData', 'PCATissueSubset1299.RData', 'PCATissueSubset1306.RData',
+                'PCATissueSubset1314.RData', 'PCATissueSubset1317.RData', 'PCATissueSubset1324.RData',
+                'PCATissueSubset3210.RData', 'PCATissueSubset19732.RData')
+lapply(file_names,load,environment())
+
+# merge objects together
+tissue_merge <- merge(PCATissueSubset1196, c(PCATissueSubset1258, PCATissueSubset1294, PCATissueSubset1296,
+                                             PCATissueSubset1299, PCATissueSubset1306, PCATissueSubset1314,
+                                             PCATissueSubset1317, PCATissueSubset1324, PCATissueSubset19732, 
+                                             PCATissueSubset3210))
+
+# All genes in object
+all_genes <- rownames(tissue_merge)
+
+# Find common cell types for patients (Simple_Relabelling)
+# Some cells have < 10 cells for some cell types
+table(tissue_merge$Collapsed_labels, tissue_merge$ID)
+wanted_cell_type <- c('B Cells', 'CD4 T Cells', 'CD8 T Cells', 'Dendritic Cell', 'Epithelial', 'Fibroblast', 'Mast Cells', 'Myeloid', 'NK Cells')
+
+# Subset wanted cell types into new object
+Idents(tissue_merge) <- 'Collapsed_labels'
+tissue_merge_class <- subset(tissue_merge, idents = wanted_cell_type)
+
+```
+
+```{r}
+# Visualizing the markers used to define every cell type
+DotPlot(tissue_merge_class, features = c('HLA-DRA', 'CD79A', 'MS4A1', 'CD3D', 'CD3E', 'CD4', 'CD8A','NKG7','GZMB','SPP1','CD14','ITGAX','ITGAM','APOE','LYZ','IRF7','CLU','CPA3','TPSAB1','ACTA2','PDGFRB','COL1A1','COL3A1','CDH11','TFF1','KRT18','KRT19','KRT8'), dot.scale = 10) + RotatedAxis()
+```
+
+# Feature Selection
+```{r}
+# DE with batch correction
+tissue_merge_class_DE <- FindAllMarkers(tissue_merge_class, test.use = 'LR', latent.vars = 'ID')
+```
+
+```{r}
+# Filter DE genes of RP and MT- genes
+filt_genes <- unique(tissue_merge_class_DE$gene[grep('^RP|^MT-', tissue_merge_class_DE$gene)])
+DE_filt <- tissue_merge_class_DE %>% group_by(cluster) %>% filter(!gene %in% filt_genes)
+
+# Get genes where p_val_adj < .05
+DE_filt <- DE_filt %>% group_by(cluster) %>% filter(p_val_adj < .05)
+cell_type_gene_list <- lapply(wanted_cell_type, function(x) DE_filt$gene[which(DE_filt$cluster == x)])
+names(cell_type_gene_list) <- wanted_cell_type
+
+# Create data frame of DE genes and wanted cell types
+metadata_list <- c('Collapsed_labels', 'ID', 'DiseaseState')
+tissue_data <- FetchData(tissue_merge, vars = c(unique(DE_filt$gene), metadata_list))
+tissue_data <- tissue_data %>% filter(Collapsed_labels %in% wanted_cell_type)
+```
+
+```{r}
+# Function that filters genes with zero variance and highly correlations
+# If hasBatch = T, it will take a long time to calculate partial correlations
+gene_cor_filter <- function(gene_data, labels_data, meta_data, cell_type_gene_list, cor_thresh = .9, hasBatch = F, batch_var = NULL) {
+  
+  gene_filt_list <- list()
+  
+  for (current_cell_type in names(cell_type_gene_list)) {
+    
+    cat('Filtering', current_cell_type, '\n', sep = ' ')
+    
+    # subset cells by cell type
+    cell_type_index <- which(labels_data == current_cell_type)
+    sub_gene_data <- gene_data[cell_type_index, cell_type_gene_list[[current_cell_type]]]
+    
+    # check for zero variance among genes
+    # if there are genes with zero variance, then filter them out
+    cell_type_var <- nearZeroVar(sub_gene_data, saveMetrics = T)
+    print(table(cell_type_var$nzv))
+    zero_var_genes <- rownames(cell_type_var)[cell_type_var$nzv]
+    if (length(zero_var_genes) > 0) {
+      sub_gene_data <- sub_gene_data[,!colnames(sub_gene_data) %in% zero_var_genes]
+    }
+    
+    # calculate correlation
+    # if cor > cor_threshold for genes, then filter them out
+    if (hasBatch) {
+      batch <- model.matrix(~factor(meta_data[cell_type_index,batch_var])+0)
+      cell_type_cor <- data.frame()
+      
+      pb <- txtProgressBar(min = 0, max = ncol(sub_gene_data), style = 3)
+      
+      for (i in 1:ncol(sub_gene_data)) {
+        for (j in 1:ncol(sub_gene_data)) {
+          if (i != j) {
+            pcorr <- pcor.test(sub_gene_data[,i], sub_gene_data[,j], batch, method = 'pearson')
+            cell_type_cor[i,j] <- pcorr$estimate
+            cell_type_cor[j,i] <- pcorr$estimate
+          }
+          else {
+            cell_type_cor[i,j] <- 1
+            break
+          }
+        }
+        setTxtProgressBar(pb, i)
+      }
+      print(max(cell_type_cor))
+    }
+    else {
+      cell_type_cor <- cor(sub_gene_data, method = 'spearman')
+      print(max(cell_type_cor))
+    }
+    
+    diag(cell_type_cor) <- 0
+    high_cor_genes <- findCorrelation(cell_type_cor, cutoff = cor_thresh)
+    if (length(high_cor_genes) > 0) {
+      sub_gene_data <- sub_gene_data[,!colnames(sub_gene_data) %in% high_cor_genes]
+    }
+    
+    sub_gene_data <- cbind(sub_gene_data, meta_data[cell_type_index,])
+    
+    # Add filtered data.frame to list
+    gene_filt_list[[current_cell_type]] <- sub_gene_data
+  }
+  
+  return(gene_filt_list)
+}
+```
+
+```{r}
+# separate data.frames to (cell, gene), (cell, cell type), and (cell, metadata)
+num_metadata_cols <- 3 # number of metadata columns
+tissue_data_gene <- tissue_data[,1:(ncol(tissue_data)-num_metadata_cols)] #(cell, gene)
+tissue_data_labels <- tissue_data[,metadata_list[1]]
+tissue_data_metadata <- tissue_data[,metadata_list[2:3]]
+
+filtered_gene_data_batch <- gene_cor_filter(tissue_data_gene, tissue_data_labels, tissue_data_metadata, cell_type_gene_list, cor_thresh = .9, hasBatch = T, batch_var = 'ID')
+```
+
+```{r}
+# export data invidually by cell type
+
+indices <- lapply(wanted_cell_type, function(x) which(tissue_data_labels == x))
+
+write.csv(cbind(filtered_gene_data_batch$`B Cells`, tissue_data_metadata[indices[[1]],]), file = 'bioinf590_project_b_cell_filt_batch_112519.csv')
+write.csv(cbind(filtered_gene_data_batch$`CD4 T Cells`, tissue_data_metadata[indices[[2]],]), file = 'bioinf590_project_cd4_T_cell_filt_batch_112519.csv')
+write.csv(cbind(filtered_gene_data_batch$`CD8 T Cells`, tissue_data_metadata[indices[[3]],]), file = 'bioinf590_project_cd8_T_cell_filt_batch_112519.csv')
+write.csv(cbind(filtered_gene_data_batch$`Dendritic Cell`, tissue_data_metadata[indices[[4]],]), file = 'bioinf590_project_dendritic_cell_filt_batch_112519.csv')
+write.csv(cbind(filtered_gene_data_batch$Epithelial, tissue_data_metadata[indices[[5]],]), file = 'bioinf590_project_epithelial_filt_batch_112519.csv')
+write.csv(cbind(filtered_gene_data_batch$Fibroblast, tissue_data_metadata[indices[[6]],]), file = 'bioinf590_project_fibroblast_filt_batch_112519.csv')
+write.csv(cbind(filtered_gene_data_batch$`Mast Cells`, tissue_data_metadata[indices[[7]],]), file = 'bioinf590_project_mast_cell_filt_batch_112519.csv')
+write.csv(cbind(filtered_gene_data_batch$Myeloid, tissue_data_metadata[indices[[8]],]), file = 'bioinf590_project_myeloid_filt_batch_112519.csv')
+write.csv(cbind(filtered_gene_data_batch$`NK Cells`, tissue_data_metadata[indices[[9]],]), file = 'bioinf590_project_nk_cell_filt_batch_112519.csv')
+```
+
+# Random Forest Predictive Gene Analysis
+```{r}
+# B cells
+cells_sub <- subset(tissue_merge_class, idents = wanted_cell_type[1])
+DotPlot(cells_sub, features = c('SRGN', 'RGS1', 'MS4A1', 'CKLF', 'TLE1', 'HLA-DPA1', 'UBC', 'RGS2', 'SLA', 'NR4A2'), group.by = 'ID') + RotatedAxis()
+```
+
+```{r}
+# CD4 T cells
+cells_sub <- subset(tissue_merge_class, idents = wanted_cell_type[2])
+DotPlot(cells_sub, features = c('DUSP1', 'RRBP1', 'MYADM', 'CD69', 'EEF1D', 'TSPO', 'ZFP36', 'CTSW', 'TUBB4B', 'CEBPB'), group.by = 'ID') + RotatedAxis()
+```
+
+```{r}
+# CD8 T cells
+cells_sub <- subset(tissue_merge_class, idents = wanted_cell_type[3])
+DotPlot(cells_sub, features = c('CD69', 'KLF2', 'KLRC1', 'HLA-A', 'FAM65B', 'AIM1', 'CCL4', 'GNLY', 'GZMA', 'SPINK1'), group.by = 'ID') + RotatedAxis()
+```
+
+```{r}
+# DC cells
+cells_sub <- subset(tissue_merge_class, idents = wanted_cell_type[4])
+DotPlot(cells_sub, features = c('RHOB', 'AREG', 'PRSS1', 'SLC11A1', 'VSIG4', 'FKBP5', 'SPINK1', 'CD7', 'LRP1', 'SEC11A'), group.by = 'ID') + RotatedAxis()
+```
+
+```{r}
+# Epithelial
+cells_sub <- subset(tissue_merge_class, idents = wanted_cell_type[5])
+DotPlot(cells_sub, features = c('PLA2G1B', 'CLPS', 'CPA1', 'PNLIP', 'CTRB2', 'AMBP', 'CELA3B', 'HOMER2', 'CTRC', 'CITED4'), group.by = 'ID') + RotatedAxis()
+```
+
+```{r}
+# Fibroblast
+cells_sub <- subset(tissue_merge_class, idents = wanted_cell_type[6])
+DotPlot(cells_sub, features = c('RERGL', 'PRSS1', 'C11orf96', 'PNLIP', 'GPX3', 'RHOB', 'TINAGL1', 'MT1A', 'CLPS', 'FABP4'), group.by = 'ID') + RotatedAxis()
+```
+
+```{r}
+# Myeloid
+cells_sub <- subset(tissue_merge_class, idents = wanted_cell_type[7])
+DotPlot(cells_sub, features = c('PRSS1', 'CPB1', 'REG1A', 'CTRB2', 'S100P', 'MNDA', 'CFLAR', 'SMCHD1', 'PTAFR', 'FCGR2A'), group.by = 'ID') + RotatedAxis()
+```
+
+```{r}
+# Mast cells
+cells_sub <- subset(tissue_merge_class, idents = wanted_cell_type[8])
+DotPlot(cells_sub, features = c('PRSS1', 'TXNIP', 'TPSAB1', 'AREG', 'CPA3', 'CD9', 'BATF', 'LMNA', 'REL', 'CLU'), group.by = 'ID') + RotatedAxis()
+```
+
+```{r}
+# NK cells
+cells_sub <- subset(tissue_merge_class, idents = wanted_cell_type[9])
+DotPlot(cells_sub, features = c('PRSS1', 'SYTL3', 'CCL4', 'SPINK1', 'DIP2A', 'ISG20', 'APBA2', 'DUSP1', 'CD53', 'DUSP2'), group.by = 'ID') + RotatedAxis()
+```
+
+
+
